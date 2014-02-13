@@ -69,6 +69,7 @@ MDPVersion::MDPVersion()
     mMacroTileEnabled = false;
     mLowBw = 0;
     mHighBw = 0;
+    mSourceSplit = false;
 
     updatePanelInfo();
 
@@ -259,6 +260,9 @@ bool MDPVersion::updateSysFsInfo() {
                                     strlen("tile_format"))) {
                            if(enableMacroTile)
                                mMacroTileEnabled = true;
+                        } else if(!strncmp(tokens[i], "src_split",
+                                    strlen("src_split"))) {
+                            mSourceSplit = true;
                         }
                     }
                 }
@@ -326,6 +330,10 @@ bool MDPVersion::supportsBWC() {
 bool MDPVersion::supportsMacroTile() {
     // MACRO TILE support
     return mMacroTileEnabled;
+}
+
+bool MDPVersion::isSrcSplit() const {
+    return mSourceSplit;
 }
 
 bool MDPVersion::is8x26() {

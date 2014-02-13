@@ -132,6 +132,7 @@ public:
     int getHeightAlign() { return mPanelInfo.mHeightAlign; }
     unsigned long getLowBw() { return mLowBw; }
     unsigned long getHighBw() { return mHighBw; }
+    bool isSrcSplit() const;
     bool is8x26();
     bool is8x74v2();
     bool is8084();
@@ -158,6 +159,7 @@ private:
     PanelInfo mPanelInfo;
     unsigned long mLowBw; //kbps
     unsigned long mHighBw; //kbps
+    bool mSourceSplit;
 };
 }; //namespace qdutils
 #endif //INCLUDE_LIBQCOMUTILS_MDPVER
