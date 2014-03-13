@@ -133,10 +133,12 @@ public:
     unsigned long getLowBw() { return mLowBw; }
     unsigned long getHighBw() { return mHighBw; }
     bool isSrcSplit() const;
+    bool isRGBScalarSupported() const;
     bool is8x26();
     bool is8x74v2();
     bool is8084();
     bool is8092();
+    bool is8x16();
 
 private:
     bool updateSysFsInfo();
@@ -160,6 +162,7 @@ private:
     unsigned long mLowBw; //kbps
     unsigned long mHighBw; //kbps
     bool mSourceSplit;
+    bool mRGBHasNoScalar;
 };
 }; //namespace qdutils
 #endif //INCLUDE_LIBQCOMUTILS_MDPVER
