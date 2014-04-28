@@ -52,6 +52,26 @@ using namespace overlay;
 using namespace overlay::utils;
 namespace ovutils = overlay::utils;
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+EGLAPI EGLBoolean eglGpuPerfHintQCOM(EGLDisplay dpy, EGLContext ctx,
+                                           EGLint *attrib_list);
+#define EGL_GPU_HINT_1        0x32D0
+#define EGL_GPU_HINT_2        0x32D1
+
+#define EGL_GPU_LEVEL_0       0x0
+#define EGL_GPU_LEVEL_1       0x1
+#define EGL_GPU_LEVEL_2       0x2
+#define EGL_GPU_LEVEL_3       0x3
+#define EGL_GPU_LEVEL_4       0x4
+#define EGL_GPU_LEVEL_5       0x5
+
+#ifdef __cplusplus
+}
+#endif
+
 namespace qhwc {
 
 bool isValidResolution(hwc_context_t *ctx, uint32_t xres, uint32_t yres)
@@ -245,6 +265,15 @@ void initContext(hwc_context_t *ctx)
             && !strcmp(value, "true")) {
         ctx->mMDPDownscaleEnabled = true;
     }
+
+    // Initialize gpu perfomance hint related parameters
+    property_get("sys.hwc.gpu_perf_mode", value, "0");
+    ctx->mGPUHintInfo.mGpuPerfModeEnable = atoi(value)? true : false;
+
+    ctx->mGPUHintInfo.mEGLDisplay = NULL;
+    ctx->mGPUHintInfo.mEGLContext = NULL;
+    ctx->mGPUHintInfo.mPrevCompositionGLES = false;
+    ctx->mGPUHintInfo.mCurrGPUPerfMode = EGL_GPU_LEVEL_0;
 
     ALOGI("Initializing Qualcomm Hardware Composer");
     ALOGI("MDP version: %d", ctx->mMDP.version);
@@ -746,6 +775,28 @@ static void trimList(hwc_context_t *ctx, hwc_display_contents_1_t *list,
     }
 }
 
+hwc_rect_t calculateDisplayViewFrame(hwc_context_t *ctx, int dpy) {
+    int dstWidth = ctx->dpyAttr[dpy].xres;
+    int dstHeight = ctx->dpyAttr[dpy].yres;
+    int srcWidth = ctx->dpyAttr[HWC_DISPLAY_PRIMARY].xres;
+    int srcHeight = ctx->dpyAttr[HWC_DISPLAY_PRIMARY].yres;
+    // default we assume viewframe as a full frame for primary display
+    hwc_rect outRect = {0, 0, dstWidth, dstHeight};
+    if(dpy) {
+        // swap srcWidth and srcHeight, if the device orientation is 90 or 270.
+        if(ctx->deviceOrientation & 0x1) {
+            swap(srcWidth, srcHeight);
+        }
+        // Get Aspect Ratio for external
+        getAspectRatioPosition(dstWidth, dstHeight, srcWidth,
+                            srcHeight, outRect);
+    }
+    ALOGD_IF(HWC_UTILS_DEBUG, "%s: view frame for dpy %d is [%d %d %d %d]",
+        __FUNCTION__, dpy, outRect.left, outRect.top,
+        outRect.right, outRect.bottom);
+    return outRect;
+}
+
 void setListStats(hwc_context_t *ctx,
         hwc_display_contents_1_t *list, int dpy) {
     const int prevYuvCount = ctx->listStats[dpy].yuvCount;
@@ -769,13 +820,14 @@ void setListStats(hwc_context_t *ctx,
     trimList(ctx, list, dpy);
     optimizeLayerRects(list);
 
+    // Calculate view frame of ext display from primary resolution
+    // and primary device orientation.
+    ctx->mViewFrame[dpy] = calculateDisplayViewFrame(ctx, dpy);
+
     for (size_t i = 0; i < (size_t)ctx->listStats[dpy].numAppLayers; i++) {
         hwc_layer_1_t const* layer = &list->hwLayers[i];
         private_handle_t *hnd = (private_handle_t *)layer->handle;
 
-        // Calculate view frame of each display from the layer displayframe
-        ctx->mViewFrame[dpy] = getUnion(ctx->mViewFrame[dpy],
-                                        layer->displayFrame);
 #ifdef QCOM_BSP
         if (layer->flags & HWC_SCREENSHOT_ANIMATOR_LAYER) {
             ctx->listStats[dpy].isDisplayAnimating = true;
@@ -925,8 +977,14 @@ bool isSecureModePolicy(int mdpVersion) {
 bool isActionSafePresent(hwc_context_t *ctx, int dpy) {
     // if external supports underscan, do nothing
     // it will be taken care in the driver
-    if(!dpy || ctx->mExtDisplay->isCEUnderscanSupported())
+    // Disable Action safe for 8974 due to HW limitation for downscaling
+    // layers with overlapped region
+    // Disable Actionsafe for non HDMI displays.
+    if(!(dpy == HWC_DISPLAY_EXTERNAL) ||
+        qdutils::MDPVersion::getInstance().is8x74v2() ||
+        ctx->mExtDisplay->isCEUnderscanSupported()) {
         return false;
+    }
 
     char value[PROPERTY_VALUE_MAX];
     // Read action safe properties
@@ -1549,6 +1607,7 @@ int configureNonSplit(hwc_context_t *ctx, hwc_layer_1_t *layer,
             ((transform & HWC_TRANSFORM_ROT_90) || downscale)) {
         *rot = ctx->mRotMgr->getNext();
         if(*rot == NULL) return -1;
+        ctx->mLayerRotMap[dpy]->add(layer, *rot);
         if(!dpy)
             BwcPM::setBwc(crop, dst, transform, mdpFlags);
         //Configure rotator for pre-rotation
@@ -1556,7 +1615,6 @@ int configureNonSplit(hwc_context_t *ctx, hwc_layer_1_t *layer,
             ALOGE("%s: configRotator failed!", __FUNCTION__);
             return -1;
         }
-        ctx->mLayerRotMap[dpy]->add(layer, *rot);
         whf.format = (*rot)->getDstFormat();
         updateSource(orient, whf, crop);
         rotFlags |= ovutils::ROT_PREROTATED;
@@ -1636,6 +1694,10 @@ int configureSplit(hwc_context_t *ctx, hwc_layer_1_t *layer,
             whf.format = getMdpFormat(HAL_PIXEL_FORMAT_BGRX_8888);
     }
 
+    /* Calculate the external display position based on MDP downscale,
+       ActionSafe, and extorientation features. */
+    calcExtDisplayPosition(ctx, hnd, dpy, crop, dst, transform, orient);
+
     setMdpFlags(layer, mdpFlagsL, 0, transform);
 
     if(lDest != OV_INVALID && rDest != OV_INVALID) {
@@ -1653,12 +1715,12 @@ int configureSplit(hwc_context_t *ctx, hwc_layer_1_t *layer,
     if(isYuvBuffer(hnd) && (transform & HWC_TRANSFORM_ROT_90)) {
         (*rot) = ctx->mRotMgr->getNext();
         if((*rot) == NULL) return -1;
+        ctx->mLayerRotMap[dpy]->add(layer, *rot);
         //Configure rotator for pre-rotation
         if(configRotator(*rot, whf, crop, mdpFlagsL, orient, downscale) < 0) {
             ALOGE("%s: configRotator failed!", __FUNCTION__);
             return -1;
         }
-        ctx->mLayerRotMap[dpy]->add(layer, *rot);
         whf.format = (*rot)->getDstFormat();
         updateSource(orient, whf, crop);
         rotFlags |= ROT_PREROTATED;
@@ -1771,12 +1833,17 @@ int configureSourceSplit(hwc_context_t *ctx, hwc_layer_1_t *layer,
     Whf whf(getWidth(hnd), getHeight(hnd),
             getMdpFormat(hnd->format), (uint32_t)hnd->size);
 
+    /* Calculate the external display position based on MDP downscale,
+       ActionSafe, and extorientation features. */
+    calcExtDisplayPosition(ctx, hnd, dpy, crop, dst, transform, orient);
+
     setMdpFlags(layer, mdpFlagsL, 0, transform);
     trimLayer(ctx, dpy, transform, crop, dst);
 
     if(isYuvBuffer(hnd) && (transform & HWC_TRANSFORM_ROT_90)) {
         (*rot) = ctx->mRotMgr->getNext();
         if((*rot) == NULL) return -1;
+        ctx->mLayerRotMap[dpy]->add(layer, *rot);
         if(!dpy)
             BwcPM::setBwc(crop, dst, transform, mdpFlagsL);
         //Configure rotator for pre-rotation
@@ -1784,7 +1851,6 @@ int configureSourceSplit(hwc_context_t *ctx, hwc_layer_1_t *layer,
             ALOGE("%s: configRotator failed!", __FUNCTION__);
             return -1;
         }
-        ctx->mLayerRotMap[dpy]->add(layer, *rot);
         whf.format = (*rot)->getDstFormat();
         updateSource(orient, whf, crop);
         rotFlags |= ROT_PREROTATED;
@@ -1936,6 +2002,78 @@ bool canUseMDPforVirtualDisplay(hwc_context_t* ctx,
     }
 
     return true;
+}
+
+bool isGLESComp(hwc_context_t *ctx,
+                     hwc_display_contents_1_t* list) {
+    int numAppLayers = ctx->listStats[HWC_DISPLAY_PRIMARY].numAppLayers;
+    for(int index = 0; index < numAppLayers; index++) {
+        hwc_layer_1_t* layer = &(list->hwLayers[index]);
+        if(layer->compositionType == HWC_FRAMEBUFFER)
+            return true;
+    }
+    return false;
+}
+
+void setGPUHint(hwc_context_t* ctx, hwc_display_contents_1_t* list) {
+    struct gpu_hint_info *gpuHint = &ctx->mGPUHintInfo;
+    if(!gpuHint->mGpuPerfModeEnable)
+        return;
+    /* Set the GPU hint flag to high for MIXED/GPU composition only for
+       first frame after MDP -> GPU/MIXED mode transition. Set the GPU
+       hint to default if the previous composition is GPU or current GPU
+       composition is due to idle fallback */
+    if(!gpuHint->mEGLDisplay || !gpuHint->mEGLContext) {
+        gpuHint->mEGLDisplay = eglGetCurrentDisplay();
+        if(!gpuHint->mEGLDisplay) {
+            ALOGW("%s Warning: EGL current display is NULL", __FUNCTION__);
+            return;
+        }
+        gpuHint->mEGLContext = eglGetCurrentContext();
+        if(!gpuHint->mEGLContext) {
+            ALOGW("%s Warning: EGL current context is NULL", __FUNCTION__);
+            return;
+        }
+    }
+    if(isGLESComp(ctx, list)) {
+        if(!gpuHint->mPrevCompositionGLES && !MDPComp::isIdleFallback()) {
+            EGLint attr_list[] = {EGL_GPU_HINT_1,
+                                  EGL_GPU_LEVEL_3,
+                                  EGL_NONE };
+            if((gpuHint->mCurrGPUPerfMode != EGL_GPU_LEVEL_3) &&
+                !eglGpuPerfHintQCOM(gpuHint->mEGLDisplay,
+                                    gpuHint->mEGLContext, attr_list)) {
+                ALOGW("eglGpuPerfHintQCOM failed for Built in display");
+            } else {
+                gpuHint->mCurrGPUPerfMode = EGL_GPU_LEVEL_3;
+                gpuHint->mPrevCompositionGLES = true;
+            }
+        } else {
+            EGLint attr_list[] = {EGL_GPU_HINT_1,
+                                  EGL_GPU_LEVEL_0,
+                                  EGL_NONE };
+            if((gpuHint->mCurrGPUPerfMode != EGL_GPU_LEVEL_0) &&
+                !eglGpuPerfHintQCOM(gpuHint->mEGLDisplay,
+                                    gpuHint->mEGLContext, attr_list)) {
+                ALOGW("eglGpuPerfHintQCOM failed for Built in display");
+            } else {
+                gpuHint->mCurrGPUPerfMode = EGL_GPU_LEVEL_0;
+            }
+        }
+    } else {
+        /* set the GPU hint flag to default for MDP composition */
+        EGLint attr_list[] = {EGL_GPU_HINT_1,
+                              EGL_GPU_LEVEL_0,
+                              EGL_NONE };
+        if((gpuHint->mCurrGPUPerfMode != EGL_GPU_LEVEL_0) &&
+                !eglGpuPerfHintQCOM(gpuHint->mEGLDisplay,
+                                    gpuHint->mEGLContext, attr_list)) {
+            ALOGW("eglGpuPerfHintQCOM failed for Built in display");
+        } else {
+            gpuHint->mCurrGPUPerfMode = EGL_GPU_LEVEL_0;
+        }
+        gpuHint->mPrevCompositionGLES = false;
+    }
 }
 
 void BwcPM::setBwc(const hwc_rect_t& crop,

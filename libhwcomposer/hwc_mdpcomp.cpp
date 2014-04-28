@@ -45,10 +45,12 @@ bool MDPComp::sEnableMixedMode = true;
 bool MDPComp::sEnablePartialFrameUpdate = false;
 int MDPComp::sMaxPipesPerMixer = MAX_PIPES_PER_MIXER;
 bool MDPComp::sEnable4k2kYUVSplit = false;
-
+bool MDPComp::sSrcSplitEnabled = false;
 MDPComp* MDPComp::getObject(hwc_context_t *ctx, const int& dpy) {
+
     if(isDisplaySplit(ctx, dpy)) {
         if(qdutils::MDPVersion::getInstance().isSrcSplit()) {
+            sSrcSplitEnabled = true;
             return new MDPCompSrcSplit(dpy);
         }
         return new MDPCompSplit(dpy);
@@ -342,25 +344,38 @@ bool MDPComp::isValidDimension(hwc_context_t *ctx, hwc_layer_1_t *layer) {
         return false;
 
     if((w_scale > 1.0f) || (h_scale > 1.0f)) {
-        const uint32_t downscale =
+        const uint32_t maxMDPDownscale =
             qdutils::MDPVersion::getInstance().getMaxMDPDownscale();
         const float w_dscale = w_scale;
         const float h_dscale = h_scale;
 
         if(ctx->mMDP.version >= qdutils::MDSS_V5) {
-            /* Workaround for downscales larger than 4x.
-             * Will be removed once decimator block is enabled for MDSS
-             */
+
             if(!qdutils::MDPVersion::getInstance().supportsDecimation()) {
-                if(crop_w > MAX_DISPLAY_DIM || w_dscale > downscale ||
-                   h_dscale > downscale)
+                /* On targets that doesnt support Decimation (eg.,8x26)
+                 * maximum downscale support is overlay pipe downscale.
+                 */
+                if(crop_w > MAX_DISPLAY_DIM || w_dscale > maxMDPDownscale ||
+                        h_dscale > maxMDPDownscale)
                     return false;
             } else {
-                if(w_dscale > 64 || h_dscale > 64)
+                // Decimation on macrotile format layers is not supported.
+                if(isTileRendered(hnd)) {
+                    /* MDP can read maximum MAX_DISPLAY_DIM width.
+                     * Bail out if
+                     *      1. Src crop > MAX_DISPLAY_DIM on nonsplit MDPComp
+                     *      2. exceeds maximum downscale limit
+                     */
+                    if(((crop_w > MAX_DISPLAY_DIM) && !sSrcSplitEnabled) ||
+                            w_dscale > maxMDPDownscale ||
+                            h_dscale > maxMDPDownscale) {
+                        return false;
+                    }
+                } else if(w_dscale > 64 || h_dscale > 64)
                     return false;
             }
         } else { //A-family
-            if(w_dscale > downscale || h_dscale > downscale)
+            if(w_dscale > maxMDPDownscale || h_dscale > maxMDPDownscale)
                 return false;
         }
     }
@@ -1363,7 +1378,7 @@ void MDPCompNonSplit::adjustForSourceSplit(hwc_context_t *ctx,
         for(int index = 0; index < n4k2kYuvCount; index++){
             int n4k2kYuvIndex =
                     ctx->listStats[mDpy].yuv4k2kIndices[index];
-            if(mCurrentFrame.fbZ > n4k2kYuvIndex){
+            if(mCurrentFrame.fbZ >= n4k2kYuvIndex){
                 mCurrentFrame.fbZ += 1;
             }
         }
@@ -1585,7 +1600,7 @@ void MDPCompSplit::adjustForSourceSplit(hwc_context_t *ctx,
         if((dst.left > lSplit) || (dst.right < lSplit)) {
             mCurrentFrame.mdpCount += 1;
         }
-        if(mCurrentFrame.fbZ > n4k2kYuvIndex){
+        if(mCurrentFrame.fbZ >= n4k2kYuvIndex){
             mCurrentFrame.fbZ += 1;
         }
     }
@@ -1932,12 +1947,12 @@ int MDPCompSrcSplit::configure(hwc_context_t *ctx, hwc_layer_1_t *layer,
     if(isYuvBuffer(hnd) && (transform & HWC_TRANSFORM_ROT_90)) {
         (*rot) = ctx->mRotMgr->getNext();
         if((*rot) == NULL) return -1;
+        ctx->mLayerRotMap[mDpy]->add(layer, *rot);
         //Configure rotator for pre-rotation
         if(configRotator(*rot, whf, crop, mdpFlagsL, orient, downscale) < 0) {
             ALOGE("%s: configRotator failed!", __FUNCTION__);
             return -1;
         }
-        ctx->mLayerRotMap[mDpy]->add(layer, *rot);
         whf.format = (*rot)->getDstFormat();
         updateSource(orient, whf, crop);
         rotFlags |= ROT_PREROTATED;
